@@ -1,0 +1,3 @@
+# this is a dummy file used to spoof file inputs for NextFlow when there are optional inputs to processes
+# for more details see the old NextFlow patterns documentation:
+# https://nextflow-io.github.io/patterns/index.html#_optional_input

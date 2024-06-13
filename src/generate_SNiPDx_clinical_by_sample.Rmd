@@ -1,0 +1,1145 @@
+---
+title: "SNiPDx Integration"
+subtitle: "Clinical  `r params$currTrial`: Sample: "
+#author: "Nicole Tran"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    code_download: true
+    collapsed: yes
+    highlight: tango
+    number_sections: no
+    theme: yeti
+    toc: yes
+    toc_float: yes
+fontsize: 25pt
+editor_options:
+  chunk_output_type: console
+params:
+  #inExtensions: inExtensions
+  inInventory: inInventory
+  inSamplesFolder: inSamplesFolder
+  inVendorData: inVendorData
+  currTrial: currTrial
+  panalAnnotations: panalAnnotations
+  currSample: currSample
+---
+<style>
+    body {
+    	font-size: 16px;
+        text-align: justify;
+    }
+
+    .main-container {
+        max-width: 80%;
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    code {
+    	font-size: 75%;
+    }
+
+    code.r {
+    	font-size: 80%;
+    }
+
+    div.main-container {
+        max-width: 80%;
+    }
+</style>
+
+```{r, inputVar, echo = FALSE, eval=FALSE}
+# ==== specify input variables here ====
+
+#interactive session
+params <- list()
+params$currTrial <- "rp630602"
+# test when indiv sample has no variants
+#params$currSample <- "5745853_GER2206772_D1_N1_LP220510237_3_RBC3_BC11_PL220314_SEQ_2206060285" 
+# test when indiv samples has variants
+params$currSample <- "329220030_GER2206553EP_D1_D1_N1_LP220510237_7_RBC3_BC7_PL220314_SEQ_2206060285" 
+
+params$inExtensions <- here::here("/ClinBio/SP-ClinicalBioinformatics/shared/git-repos/reparecompbio/clinicalbioinfoextensions/")
+
+params$inInventory <- here::here("/ClinBio/SP-ClinicalBioinformatics/shared/SNiPDx/RP6306-02/vendor-data/INVENTORY/rp6306-02_genosity_inv_2022-07-19.csv")
+
+params$inSamplesFolder <- here::here("/ClinBio/SP-ClinicalBioinformatics/ntran/analysis/SNIPDx/processing-sample-level/test_sgz_pred_seg2/")
+
+params$inVendorData <- here::here("/ClinBio/SP-ClinicalBioinformatics/shared/SNiPDx/RP6306-02/vendor-data/ARCHER/")
+
+params$panalAnnotations <- here::here("/ClinBio/SP-ClinicalBioinformatics/ntran/analysis/SNIPDx/processing-sample-level/nf-snipdx/refs/panel_genes_annotated-v2.tsv")
+
+
+```
+
+```{r,setup, include=FALSE}
+
+#global knit options
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, echo = FALSE)
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+
+
+library(tidyverse)
+library(rmarkdown)
+library(readxl)
+library(openxlsx)
+library(reshape2)
+library(DT)
+library(ggrepel)
+library(here)
+library(cowplot)
+library(purrr)
+library(data.table)
+library(binom)
+library(GenomicRanges)
+library(magrittr)
+
+#### ==== CLINICALBIOINFOEXTENSIONS ==== ####
+
+#### SGZ ####
+
+#### AF PRED FUNCTION ####
+#### SOMATIC ####
+predicted_AF_somatic <- function(Ci,Vi, p){
+  #### formula: (pVi)/(pCi + 2(1-p)), where Vi == Ci
+  
+  #Vi = Mi/Ci or Ci-Mi, variant allele count
+  #Vi <- Ci
+  
+  pred_AF_somatic <- as.numeric(p*Vi)/(p*Ci + 2*(1-p))
+  
+  return(pred_AF_somatic)
+}
+
+
+#### GERMLINE ####
+predicted_AF_germline <- function(Ci,Vi, p){
+  #### formula: (pVi + 1 - p)/(pCi + 2(1-p)), where Vi == Ci
+  
+  #Vi = Mi/Ci or Ci-Mi, variant allele count
+  #Vi <- Ci
+  
+  pred_AF_germline <- (p*Vi + 1 - p)/(p*Ci + 2*(1-p))
+  
+  return(pred_AF_germline)
+}
+
+
+####  STAT SIGN FUNCTIONS  ####
+#### SOMATIC ####
+p_somatic <- function(Ci, Vi, p, n, f){
+  
+  # calculate predicted somatic AF
+  pred_AF_somatic <- predicted_AF_somatic(Ci = Ci,Vi = Vi, p = p)
+
+  # calculate stat sig of prediction
+  ### formula: y ~ binomial(x,n,p) where n = coverage, p = predicated AF,
+  # and x = (n*f), where f = VAF
+  ### "y is obtained using the 2-tailed binomial test P(y|S; AFsomatic) = Bin (nf, n, AFsomatic)"
+  y <- binom.test(x = round(n*f), 
+                  n = n, 
+                  p = pred_AF_somatic,
+                  alternative = "two.sided")
+  
+  y <- y$p.value
+  
+  return(y)
+}
+
+#### GERMLINE ####
+p_germline <- function(Ci,Vi, p, n,f){
+  
+  # calculate predicted germline AF
+  pred_AF_germline <- predicted_AF_germline(Ci = Ci,Vi = Vi, p = p)
+  
+  # calculate stat sig of prediction
+  ### formula: y ~ binomial(x,n,p) where n = coverage, p = predicated AF, and x = (n*f)
+  ### "y is obtained using the 2-tailed binomial test P(y|G; AFgermline)"
+  y <- binom.test(x = round(n*f), 
+                  n = n, 
+                  p = pred_AF_germline,
+                  alternative = "two.sided")
+  
+  y <- y$p.value
+  
+  return(y)
+}
+
+##### SGZ function #####
+### wrap all SGZ calculations into a single function call, 
+#return estimated somatic and germline VAFs, pvalue for somatic and germline
+#p = facets.purity
+#f = VAF, mutational allele freq
+#Mi = facets.lcn.em.min, minor allele count, this will come up when labelling hetero/homo
+#Ci = facets.tcn.em.min, total copy number
+#n = variant level coverage
+
+SGZ <- function(sample.seq.name, gene, AAChange,
+                Ci, Mi, p, n, f ) {
+  
+  # a = alpha, constant in SGZ
+  a <- 0.01
+  
+  # CN relative to variant segment, Ci-Mi
+  Vi <- Ci-Mi 
+  
+  # set conditions if purity is NA or 0, set to .01 (pseudovalue)
+  if(is.na(p)){
+    p <- 0.01
+  }
+  
+  pred_AF_somatic <- predicted_AF_somatic(Ci = Ci,Vi = Vi, p = p)
+  
+  pred_AF_germline <- predicted_AF_germline(Ci = Ci,Vi = Vi, p = p)
+  
+  y_somatic <- p_somatic(Ci = Ci,Vi = Vi, p = p, n = n, f = f )
+  
+  y_germline <- p_germline(Ci = Ci, Vi = Vi, p = p, n = n, f = f )
+  
+ ### new implementation, recovery step for germline/somatic
+  pvaldifflog10  <- abs(-log(y_somatic,10) - log(y_germline,10))
+
+  delta_somatic_vaf  <- ((abs(f - pred_AF_somatic)) / abs(pred_AF_somatic - pred_AF_germline)) -
+    ((abs(f - pred_AF_germline) / abs(pred_AF_somatic - pred_AF_germline)))
+
+  # update purity from .2 to .3,
+  # subclonal somatic --> somatic subclonal
+  if(delta_somatic_vaf < -.5 & pvaldifflog10 > 10 & f < (pred_AF_somatic/1.5) & p > .3){
+    outcome <- "somatic subclonal"
+    # original -- else if(delta_somatic_vaf < -.6 & pvaldifflog10 > 10 )
+  }else if((delta_somatic_vaf < -.5 & pvaldifflog10 > 10) | (y_somatic > a & y_germline < 0.001) ){
+    outcome <- "somatic"
+    #delta_somatic_vaf > .6 & pvaldifflog10 > 10
+  }else if((delta_somatic_vaf > .5 & pvaldifflog10 > 10) | (y_somatic <= 0.001 & y_germline > a)){
+    outcome <- "germline"
+  }else{
+    outcome <- "ambiguous -- poor fit"
+  }
+
+
+  dfSGZ <- data.frame(`Sample Sequencing Name` = sample.seq.name,
+                      Gene = gene,
+                      AAChange = AAChange,
+                      pred_AF_somatic = pred_AF_somatic,
+                      pred_AF_germline = pred_AF_germline,
+                      pvalue_pred_somatic = y_somatic,
+                      pvalue_pred_germline = y_germline,
+                      pvaldifflog10 = pvaldifflog10,
+                      delta_somatic_vaf = delta_somatic_vaf,
+                      SGZ_pred = outcome,
+                      check.names = F)
+  
+  return(dfSGZ)
+}
+
+
+```
+
+```{r, readIn,results='hide'}
+### read data 
+Inventory <- read_csv(params$inInventory)
+# filter by currSample
+Inventory <- Inventory %>% filter(`Sample Sequencing Name` %in% params$currSample)
+#inCNV <- list.files(path = params$inVendorData,".CNV",full.names = T,recursive = T)
+inStats <- list.files(path = params$inVendorData,".Stats_Summary",full.names = T,recursive = T)
+inVariant <- list.files(path = params$inVendorData,".variant_summary",full.names = T,recursive = T)
+inSegment <- list.files(path = params$inSamplesFolder,".segments.csv", full.names = T,recursive = T)
+# grep for curSample from vector of segments.csv paths
+inSegment <- inSegment[grepl(params$currSample, inSegment)]
+
+### Read in CNV -- omit Genoisity CNV calls as of 8/18/2022
+# load in multiple files, rbind comprehensively
+# CNV <-inCNV %>% 
+#   map_df(~read_tsv(.x, 
+#                    col_types = cols(.default = "c"))) %>%
+#   mutate(F.Ploidy = as.numeric(F.Ploidy),
+#          F.Purity = as.numeric(F.Purity)) %>%
+#   # from batch SEQ_2201280043, Sample Sequencing Name in CNV tables contain a "-" in suffix
+#   # that does not match the sample IDs in inventory or Facets tables
+#   # remove last "-" from CNV sample ID to map
+#   mutate(`Sample Sequencing Name` = gsub("-[^_]+$", "", `Sample Sequencing Name`))
+# 
+# str(CNV) #check 
+
+
+### Read in Stats
+statsList <- lapply(inStats, read_tsv)
+
+sharedCols <-  Reduce(intersect,lapply(statsList, colnames))
+
+statsSharedList <- lapply(statsList, select, sharedCols)
+
+Stats <- do.call(rbind, statsSharedList)
+
+### Read in Variant
+# specify that gnomAD.Alt.Freq.All and `gnomAD Max Alt Freq` should always be of class double
+# some cases where these columns are read in as a character due to sci notations
+Variant <-
+  inVariant %>% 
+  map_df(~read_tsv(.,col_types = cols(gnomAD.Alt.Freq.All = col_double(),
+                                      `gnomAD Max Alt Freq`= col_double()))) %>% 
+# revalue MRE11A to MRE11 to match gene panel annotations 
+mutate(Gene = case_when(Gene %in%  "MRE11" ~"MRE11A",
+                                     TRUE ~ as.character(Gene)))
+
+### Read in sample level Segments file
+OrigSegments <- read_csv(inSegment) %>%
+  # create seq id column for merging
+  mutate(`Sample Sequencing Name` = params$currSample)
+
+#### DERIVE PIER SCORE at sample level (?) ####
+median.logr <- median(OrigSegments$mafR)
+std.logr <- sd(OrigSegments$mafR)
+OrigSegments$isLohPier <- OrigSegments$mafR > median.logr + std.logr
+
+OrigSegments$segments.loh.pier <- as.integer(OrigSegments$isLohPier)
+```
+
+```{r, facets, results='hide'}
+
+gene_table <- read.table(params$panalAnnotations, 
+                         sep='\t', 
+                         header = TRUE)
+
+gene_table <- gene_table[!is.na(gene_table$ensembl_gene_id) &
+                           !duplicated(gene_table$ensembl_gene_id),]
+
+gene_table <- gene_table[order(gene_table$chromosome_name, gene_table$transcript_start),]
+#gene_table$hgnc_symbol[gene_table$hgnc_symbol=='MRE11A'] <- 'MRE11'
+gene_table$hgnc_symbol_chr <- paste0(gene_table$hgnc_symbol, ' chr',gene_table$chromosome_name)
+
+gene.gr <- GRanges(seqnames=Rle(paste0('chr',gene_table$chromosome_name)),
+                   ranges=IRanges(gene_table$transcript_start, gene_table$transcript_end),
+                   strand=rep(c("*"), nrow(gene_table)))
+
+facets.files <- list.files(path = params$inSamplesFolder,
+                           pattern = "*.cnv.table.txt",
+                           all.files = FALSE,
+                           full.names = F,
+                           recursive = TRUE,
+                           ignore.case = FALSE, 
+                           include.dirs = FALSE, 
+                           no.. = FALSE) # 524 obs
+
+call.list <- list()
+# loop over all files
+for (ti in 1:length(facets.files)) {	
+  bn <- basename(facets.files[ti])
+  full_sample_name <- gsub('.cnv.table.txt|.dominik.txt', '', bn)
+  print(full_sample_name)
+  split_vec <- strsplit(bn, '_')[[1]]
+  ger_id <- split_vec[grepl('GER', split_vec)]
+  print(ger_id)
+  if (length(ger_id)==0) {
+    ger_id=NA
+  }
+  
+  
+  # prepare the data frame that will hold the results for a single case
+  sample.df <- data.frame(full_sample_id=full_sample_name,
+                          ger.id = ger_id,
+                          Gene=gene_table$hgnc_symbol,
+                          transcript_start=gene_table$transcript_start,
+                          transcript_end=gene_table$transcript_end,
+                          chr=gene_table$chromosome_name,
+                          facets.tcn.em.median=NA, facets.tcn.em.min=NA, facets.tcn.em.max=NA,
+                          facets.lcn.em.median=NA,facets.lcn.em.min=NA,
+                          facets.ploidy=NA, facets.purity=NA
+  )
+  
+  # read the facets output
+  # Facets V2
+  # facets.calls <- try(read.table(inFacets[ti], header=TRUE, sep='\t'))
+  
+  facets.calls <- withr::with_dir(params$inSamplesFolder,{
+  try(read.table(facets.files[ti], header=TRUE, sep='\t'))
+  })
+
+  
+  
+  
+  if ((class(facets.calls) == "try-error") ) {
+    print('Facets error') 
+  } else {
+    sample.df$facets.ploidy <- facets.calls$ploidy[1]
+    sample.df$facets.purity <- facets.calls$purity[1]
+    
+    # fill in missing minor copy number, according to Pier's trick
+    facets.calls$segmentSize <- facets.calls$end - facets.calls$start
+    median.logr <- median(facets.calls$mafR)
+    std.logr <- sd(facets.calls$mafR)
+    facets.calls$isLohPier <- facets.calls$mafR > median.logr + std.logr
+    
+    facets.gr <-  GRanges(paste0('chr',seqnames=Rle(facets.calls$chr)),
+                          ranges=IRanges(as.integer(facets.calls$loc.start),
+                                         as.integer(facets.calls$loc.end)),
+                          strand=rep(c("*"), nrow(facets.calls)))
+    # perform the overlap between genes and facets segments
+    # for each gene, there may be multiple overlapping segments
+    r <- as.data.frame(findOverlaps(gene.gr, facets.gr)) 
+    r$facets.tcn.em <- NA
+    r$facets.tcn.em <- facets.calls$tcn.em[r$subjectHits]
+    r$facets.lcn.em <- NA
+    r$facets.lcn.em <- facets.calls$lcn.em[r$subjectHits]
+    r$isLohPier <- NA
+    r$isLohPier <- as.integer(facets.calls$isLohPier[r$subjectHits])
+    
+    # if there are any overlaps
+    if (nrow(r)>0) {
+      
+      # total copy number: median, min and max
+      facets.tcn.em.median = aggregate(r$facets.tcn.em,
+                                       by = list(r$queryHits),
+                                       FUN = median, na.rm=TRUE)
+      facets.tcn.em.min = aggregate(r$facets.tcn.em,
+                                    by = list(r$queryHits),
+                                    FUN = min, na.rm=TRUE)
+      facets.tcn.em.max = aggregate(r$facets.tcn.em,
+                                    by = list(r$queryHits),
+                                    FUN = max, na.rm=TRUE)
+      
+      # for each gene, populate total copy number: max, min and median of overlapping segments
+      sample.df$facets.tcn.em.median[facets.tcn.em.median$Group.1] <- facets.tcn.em.median$x
+      sample.df$facets.tcn.em.min[facets.tcn.em.min$Group.1] <- facets.tcn.em.min$x
+      sample.df$facets.tcn.em.max[facets.tcn.em.max$Group.1] <- facets.tcn.em.max$x
+      
+      
+      # minor copy number: median, min
+      # mior copy number is missing for some segments (NA), and the following 
+      facets.lcn.em.median = aggregate(r$facets.lcn.em,
+                                       by = list(r$queryHits),
+                                       FUN = median, na.rm=TRUE)
+      facets.lcn.em.min = aggregate(r$facets.lcn.em,
+                                    by = list(r$queryHits),
+                                    FUN = min, na.rm=TRUE)
+      
+      # for each gene, populate minor copy number: max, min and median of overlapping segments
+      sample.df$facets.lcn.em.median[facets.lcn.em.median$Group.1] <- facets.lcn.em.median$x
+      sample.df$facets.lcn.em.min[facets.lcn.em.min$Group.1] <- facets.lcn.em.min$x
+      
+      # aggregate Pier's LOH assessment
+      facets.LOH.pier = aggregate(r$isLohPier,
+                                  by = list(r$queryHits),
+                                  FUN = min, na.rm=TRUE)
+      sample.df$facets.loh.pier[facets.LOH.pier$Group.1] <- facets.LOH.pier$x
+      
+    } 
+    
+    
+    
+    
+  }
+  # add to data frame
+  call.list[[full_sample_name]] <- sample.df
+  
+}
+
+Facets <- bind_rows(call.list)
+
+Facets[is.infinite(Facets$facets.lcn.em.min),"facets.lcn.em.min"]<- NA
+
+
+```
+
+```{r, integrate,results='hide'}
+ # modify Stats Quality params (updated 2022-07-29)
+Stats <- Stats %>%
+  mutate(Facets.Quality = case_when(`Mean Library Insert Size` < 100 |
+                                    `Percentage Duplicate Reads` > 50 |
+                                    `Mean Coverage`  < 1000 ~ "Poor",
+                                    TRUE ~ as.character("Good")))
+
+
+Variant$VAF <- Variant$FAF/100
+
+allIDs <- data.frame(`Sample Sequencing Name` =  unique(c(Inventory$`Sample Sequencing Name`)),
+                     check.names = F)
+
+StatsSelected <-  Stats %>%
+  select(`Sample Sequencing Name`,
+         `Percentage Duplicate Reads`,
+         `Mean Library Insert Size`,
+         `Mean Coverage`,
+         Facets.Quality) %>%
+  inner_join(allIDs)
+
+FacetsSelected <- Facets %>%
+  select(`Sample Sequencing Name` = full_sample_id,
+         facets.ploidy,
+         facets.purity,
+         Gene,
+         facets.tcn.em.median,
+         facets.tcn.em.min,
+         facets.tcn.em.max,
+         facets.lcn.em.median,
+         facets.lcn.em.min,
+         facets.loh.pier) %>%
+  inner_join(allIDs)
+
+### omit Genoisity CNV calls as of 8/18/2022
+# CNVLong <- CNV %>%
+#   inner_join(allIDs) %>%
+#   select(-F.Ploidy, -F.Purity) %>%
+#   melt(.,id.vars=c(1:2),variable.name = "Gene",value.name = "Call") %>%
+#   inner_join(allIDs)
+
+VariantSelected <- Variant %>%
+  select(`Sample Sequencing Name`,
+         Gene,
+         `hGVS Protein`,
+         `hGVS cDNA`,
+         VAF,
+         `Variant Effect`,
+         `Variant Type`,
+         `Rep. Class.`,
+         `Germline Class.`,
+         Rs.Clinical.Significance,
+         Chr.,
+         Pos.,
+         Ref.,
+         Alt.,
+         FDP) %>%
+  inner_join(allIDs)
+
+dfIntegSNiPDx <- allIDs %>%
+  left_join(StatsSelected) %>%
+  left_join(FacetsSelected, by = c("Sample Sequencing Name")) %>%
+  #left_join(CNVLong,by=c("Sample Sequencing Name", "Gene")) %>%
+  left_join(VariantSelected)
+
+
+
+### Calculate Expected biallelic VAF and confidenc eintervals ---OBSOLETE USE SGZ INSTEAD
+# dfIntegSNiPDx <- dfIntegSNiPDx %>%
+#   mutate(SomaticBiallelicVAF = case_when(is.na(facets.purity) ~ 0,
+#                                          TRUE ~ CalcSBVAF(facets.purity,facets.tcn.em.median))) %>%
+#   mutate(GermlineBiallelicVAF = case_when(is.na(facets.purity) ~ 0,
+#                                           TRUE ~ CalcGBVAF(facets.purity,facets.tcn.em.median)))
+
+
+#### SGZ ####
+# iterate through multiple mutational changes within the same sample
+mut_change_df <- dfIntegSNiPDx %>%
+  filter(!is.na(`hGVS Protein`)) %>%
+  group_by(`Sample Sequencing Name`) %>%
+  distinct(`hGVS Protein`, .keep_all = T)
+
+dfSGZList <- list()
+
+if(nrow(mut_change_df) != 0){
+#iterate thru each sample and alteration level, subset, and perform SGZ
+  for(currMutSample in seq(nrow(mut_change_df))){
+    print(mut_change_df[currMutSample,])
+
+    #filter on current mutational change in current sample ID
+    dfMutChange <- mut_change_df[currMutSample,]
+
+    # if lcn is a real value
+    if(!is.na(dfMutChange$facets.lcn.em.min) & is.numeric(dfMutChange$facets.lcn.em.min)){
+      Mi <- dfMutChange$facets.lcn.em.min
+    }else if (is.na(dfMutChange$facets.lcn.em.min) & dfMutChange$facets.loh.pier  %in% 1){
+      Mi <- 0
+    }else{
+      Mi <- 1
+    }
+
+    #### Call ####
+    dfSGZ <- SGZ(sample.seq.name = dfMutChange$`Sample Sequencing Name`,
+                 gene = dfMutChange$Gene,
+                 AAChange = dfMutChange$`hGVS Protein`,
+                 Ci = dfMutChange$facets.tcn.em.min,
+                 Mi = Mi,
+                 p = dfMutChange$facets.purity,
+                 n = dfMutChange$FDP,
+                 f = dfMutChange$VAF
+    )
+
+    dfSGZList[[currMutSample]] <- dfSGZ
+  }
+
+  ### compile mutational changes preds into a single df
+  resSGZ <- rbindlist(dfSGZList)
+
+  ### merge back with integrated df
+  dfIntegSNiPDx <- left_join(dfIntegSNiPDx, resSGZ,
+                              by = c("Sample Sequencing Name",
+                                     "Gene",
+                                     "hGVS Protein" = "AAChange"))
+}else{
+   #build empty SGZ df
+   resSGZ <- data.frame(`Sample Sequencing Name` = params$currSample,
+                      pred_AF_somatic = NA,
+                      pred_AF_germline = NA,
+                      pvalue_pred_somatic = NA,
+                      pvalue_pred_germline = NA,
+                      SGZ_pred = NA,
+                      check.names = F)
+
+   dfIntegSNiPDx <- left_join(dfIntegSNiPDx, resSGZ)
+}
+
+## define Copy Number
+dfIntegSNiPDx$TCN <- ceiling(dfIntegSNiPDx$facets.tcn.em.median)
+
+#Ploidy Adjusted Copy Number
+dfIntegSNiPDx$PACN <- (dfIntegSNiPDx$TCN / dfIntegSNiPDx$facets.ploidy) * 2
+dfIntegSNiPDx$CRP <- (dfIntegSNiPDx$TCN - dfIntegSNiPDx$facets.ploidy)
+
+
+### Define CNV - HomDel, Het Loss, Neutral, Gain, Amp
+dfIntegSNiPDx <- dfIntegSNiPDx %>%
+  mutate(CNV = case_when(is.na(facets.purity)~"no call",
+                         CRP >= 4  ~ "amp",
+                         CRP >= 2~ "gain",
+                         facets.tcn.em.min == 1 ~"hetloss",
+                         facets.tcn.em.min == 0 ~ "homdel",
+                         TRUE ~ "neutral"
+  )) %>%
+  mutate(Zygosity = case_when(is.na(facets.purity)~ "no call",
+                              # if facets.lcn.em.min == 0 & facets.tcn.em.min == 0 ~ "homdel" then LOH takes precedence
+                              facets.tcn.em.min == 0 ~ "homdel",
+                              facets.lcn.em.min == 0 ~ "LOH",
+                              is.na(facets.lcn.em.min) & facets.loh.pier == 1 ~ "LOH",
+                              is.na(facets.lcn.em.min) & facets.loh.pier == 0 ~ "no call",
+                              TRUE ~ "No-LOH")) %>%
+  mutate(`Allelic Status` = case_when(CNV == "homdel"~"biallelic",
+                                      (SGZ_pred %in% "germline" | SGZ_pred %in% "somatic") & !is.na(VAF) & Zygosity == "LOH"~"biallelic",
+                                      (SGZ_pred %in% "germline" | SGZ_pred %in% "somatic") & !is.na(VAF) & Zygosity == "No-LOH"~"monoallelic",
+                                      # if SGZ_pred == subclonal ~ "subclonal"
+                                      # if SGZ_pred == "ambig" ~ "no call
+                                      # if SGZ_pred =="ambig --poor fit" ~ "no call",
+                                      SGZ_pred %in% "somatic subclonal" ~ "subclonal",
+                                      SGZ_pred %in% "ambiguous -- poor fit" | SGZ_pred %in% "ambiguous" ~ "no call",
+                                      !is.na(VAF) & Zygosity == "no call"~"inconsistent",
+                                      TRUE ~ as.character(NA)))
+
+
+Calls <- dfIntegSNiPDx %>%
+  select(any_of(c("Sample Sequencing Name",
+                  "Gene",
+                  "facets.tcn.em.min",
+                  "facets.lcn.em.min",
+                  "facets.purity",
+                  "facets.ploidy" ,
+                  "facets.loh.pier",
+                  "CNV",
+                  "TCN",
+                  "PACN",
+                  #copy number relative to ploidy
+                  "CRP",
+                  "Zygosity",
+                  "Allelic Status",
+                  "hGVS Protein",
+                  "hGVS cDNA",
+                  "Rep. Class.",
+                  "VAF",
+                  colnames(resSGZ)))) %>%
+  #remove distinct, only display if protein change is not NA or if CNV is amp, gain, homdel
+  filter(!is.na(`hGVS cDNA`) | CNV %in% c("amp", "gain", "homdel"))
+
+
+# not all sampleIDs are present in Inventory
+dfIntegInventory <- inner_join(dfIntegSNiPDx, Inventory)
+
+if(params$currTrial != "non-clinical"){
+    # # top level categorization of sample types
+    # dfIntegInventory <- mutate(dfIntegInventory, SAMPTYPE2 =
+    #                              case_when(SAMPTYPE == "Normalized ctDNA DNA Extraction" ~ "PBMC",
+    #                                        SAMPTYPE == "PBMC" ~ "PBMC",
+    #                                        is.na(SAMPTYPE) ~ "NA",
+    #                                        TRUE ~ "Tumor"))
+    
+    ### categorize sample types using test codes
+    dfIntegInventory <- mutate(dfIntegInventory, SAMPTYPE2 =
+                                 case_when(`Test Code` == "AA099a" ~ "PBMC",
+                                           `Test Code` == "AA091a" ~ "Tumor",
+                                           is.na(`Test Code`) ~ "NA",
+                                           TRUE ~ "Tumor"))
+
+    dfIntegInventory <- dfIntegInventory %>%
+      mutate(`Test Type` = case_when(SAMPTYPE2 %in% "PBMC" ~ "germline",
+                                     SAMPTYPE2 %in% "Tumor" ~ "tissue NGS"))
+}
+
+
+### BAM LOCATION ON GCP
+trial_to_gcp <- list("rp3500-01" = "350001",
+                     "rp3500-03" = "350003",
+                    "rp6306-01" = "rp630601",
+                    "rp6306-02" = "rp630602",
+                    "non-clinical" = "nonclin")
+
+sampID_to_gcp <- list("rp3500-01" = "SAMPID2",
+                      "rp3500-03" = "SAMPID",
+                      "rp6306-01" = "SAMPID",
+                      "rp6306-02" = "SAMPID",
+                      "non-clinical" = "SAMPID2")
+
+trial_to_gcp <- trial_to_gcp[[params$currTrial]]
+
+sampID_to_gcp <- sampID_to_gcp[[params$currTrial]]
+
+dfIntegInventory$SEQ <- paste0("SEQ_",
+                               gsub(".*SEQ_","", dfIntegInventory$`Sample Sequencing Name`))
+
+dfIntegInventory$GCP_path_to_bam <-
+  paste0("gs://quartz-bio/prd/repare_",
+                   trial_to_gcp,
+                   "_bmdb/data/source/GENOSITY/ARCHER/",
+        dfIntegInventory$SEQ, "/",
+        dfIntegInventory[,sampID_to_gcp], "/",
+        "BAM/",
+        dfIntegInventory$`Sample Sequencing Name`,
+        ".final.bam"
+        )
+```
+
+```{r,segments,results='hide'}
+#segment ploidy/purity should match sample lvl
+
+### separate snipdx and non snipdx genes, expand genes into indiv. rows
+Segments_SNIPDX <- OrigSegments %>%
+  mutate(Gene = strsplit(as.character(snipdx_genes_on_segment), split = ","),
+         SNIPDX_Gene = "snipdx gene",
+         chrom = as.numeric(gsub("chr", "", chrom))) %>%
+  tidyr::unnest(Gene) %>%
+  select(-c("snipdx_genes_on_segment",
+            "other_genes_on_segment")) #%>% 
+  #filter(!is.na(Gene)) 
+
+Segments_NonSNIPDX <- OrigSegments %>%
+  mutate(Gene = strsplit(as.character(other_genes_on_segment), split = ","),
+         SNIPDX_Gene = "nonsnipdx gene",
+         chrom = as.numeric(gsub("chr", "", chrom))) %>%
+  tidyr::unnest(Gene) %>%
+  select(-c("snipdx_genes_on_segment",
+            "other_genes_on_segment")) %>% 
+  filter(!is.na(Gene))
+
+Segments <- rbind(Segments_SNIPDX, Segments_NonSNIPDX)
+
+#### CNV Calls ####
+Segments$Seg_TCN <- ceiling(Segments$total_cn)
+
+#Ploidy Adjusted Copy Number
+Segments$Seg_PACN <- (Segments$Seg_TCN / Segments$ploidy) * 2
+Segments$Seg_CRP <- (Segments$Seg_TCN - Segments$ploidy)
+
+Segments <- Segments %>%
+  mutate(Seg_CNV = case_when(is.na(purity)~"no call",
+                           Seg_CRP >= 4  ~ "amp",
+                           Seg_CRP >= 2~ "gain",
+                           total_cn == 1 ~"hetloss",
+                           total_cn == 0 ~ "homdel",
+                           TRUE ~ "neutral")) %>%
+  mutate(Zygosity = case_when(is.na(purity)~ "no call",
+                              # if minor_cn == 0 & total_cn == 0 ~ "homdel" then LOH takes precedence
+                              total_cn == 0 ~ "homdel",
+                              minor_cn == 0 ~ "LOH",
+                              is.na(minor_cn) & segments.loh.pier == 1 ~ "LOH",
+                              is.na(minor_cn) & segments.loh.pier == 0 ~ "no call",
+                              TRUE ~ "No-LOH"))
+
+Seg_VariantSelected <- right_join(VariantSelected,
+                                  Segments,
+                                  by = c("Chr." = "chrom",
+                                         "Gene" = "Gene",
+                                         "Sample Sequencing Name" = "Sample Sequencing Name")) %>%
+  ### filter only for segments that have variants, amps, and homdel (variants or non snipdx gene)
+  filter(!is.na(`hGVS cDNA`) | Seg_CNV %in% c("amp", "homdel"))
+
+
+# if there are identiical genes on two separate segments, select variant on the correct genomic position
+# iterate through multiple mutational changes within the same sample
+seg_mut_change_df <- Seg_VariantSelected %>%
+  filter((Pos. >= start & Pos. <= end) & !is.na(`hGVS Protein`))
+
+
+# left join to preserve sample lvl inventory
+Seg_dfInventory <- left_join(Inventory,
+                         Seg_VariantSelected)
+
+#### ==== variant/segment lvl SGZ ==== ####
+seg_dfSGZList <- list()
+
+if(nrow(seg_mut_change_df) != 0){
+#iterate thru each sample and alteration level, subset, and perform SGZ
+  for(currMutSample in seq(nrow(seg_mut_change_df))){
+    print(seg_mut_change_df[currMutSample,])
+
+    #filter on current mutational change in current sample ID
+    dfMutChange <- seg_mut_change_df[currMutSample,]
+
+    # if lcn is a real value
+    if(!is.na(dfMutChange$minor_cn) & is.numeric(dfMutChange$minor_cn)){
+      Mi <- dfMutChange$minor_cn
+      ### TODO: segment level pier score
+    }else if (is.na(dfMutChange$minor_cn)){
+      Mi <- 0
+    }else{
+      Mi <- 1
+    }
+
+    #### Call ####
+    dfSGZ <- SGZ(sample.seq.name = dfMutChange$`Sample Sequencing Name`,
+                 gene = dfMutChange$Gene,
+                 AAChange = dfMutChange$`hGVS Protein`,
+                 Ci = dfMutChange$total_cn,
+                 Mi = Mi,
+                 p = dfMutChange$purity,
+                 n = dfMutChange$FDP,
+                 f = dfMutChange$VAF
+    )
+
+    seg_dfSGZList[[currMutSample]] <- dfSGZ
+  }
+
+  ### compile mutational changes preds into a single df
+  resSGZ <- rbindlist(seg_dfSGZList)
+
+### merge back with integrated df
+Seg_dfInventory <- right_join(resSGZ,Seg_dfInventory,
+                             by = c("Sample Sequencing Name",
+                                    "Gene",
+                                    "AAChange" = "hGVS Protein"))
+
+Seg_dfInventory <- Seg_dfInventory%>%
+  relocate(`hGVS cDNA`,
+            43:length(colnames(Seg_dfInventory)),
+            .after = AAChange)
+
+}else{
+   #build empty SGZ df
+   resSGZ <- data.frame(`Sample Sequencing Name` = params$currSample,
+                        Gene = NA,
+                        AAChange = NA,
+                      pred_AF_somatic = NA,
+                      pred_AF_germline = NA,
+                      pvalue_pred_somatic = NA,
+                      pvalue_pred_germline = NA,
+                      SGZ_pred = NA,
+                      check.names = F)
+
+   ### merge back with integrated df
+Seg_dfInventory <- right_join(resSGZ,Seg_dfInventory,
+                             by = c("Sample Sequencing Name",
+                                    "Gene",
+                                    "AAChange" = "hGVS Protein"))
+
+Seg_dfInventory <- Seg_dfInventory%>%
+  relocate(`hGVS cDNA`,
+            43:length(colnames(Seg_dfInventory)),
+            .after = AAChange)
+}
+
+#### ==== variant/segment lvl Calls ==== ####
+# ## define Copy Number
+# Seg_dfInventory$Seg_TCN <- ceiling(Seg_dfInventory$total_cn)
+# 
+# #Ploidy Adjusted Copy Number
+# Seg_dfInventory$Seg_PACN <- (Seg_dfInventory$Seg_TCN / Seg_dfInventory$ploidy) * 2
+# Seg_dfInventory$Seg_CRP <- (Seg_dfInventory$Seg_TCN - Seg_dfInventory$ploidy)
+
+### Define CNV - HomDel, Het Loss, Neutral, Gain, Amp
+Seg_dfInventory <- Seg_dfInventory %>%
+  mutate(`Allelic Status` = case_when(Seg_CNV == "homdel"~"biallelic",
+                                      (SGZ_pred %in% "germline" | SGZ_pred %in% "somatic") & !is.na(VAF) & Zygosity == "LOH"~"biallelic",
+                                      (SGZ_pred %in% "germline" | SGZ_pred %in% "somatic") & !is.na(VAF) & Zygosity == "No-LOH"~"monoallelic",
+                                      # if SGZ_pred == subclonal ~ "subclonal"
+                                      # if SGZ_pred == "ambig" ~ "no call
+                                      # if SGZ_pred =="ambig --poor fit" ~ "no call",
+                                      SGZ_pred %in% "somatic subclonal" ~ "subclonal",
+                                      SGZ_pred %in% "ambiguous -- poor fit" | SGZ_pred %in% "ambiguous" ~ "no call",
+                                      !is.na(VAF) & Zygosity == "no call"~"inconsistent",
+                                      TRUE ~ as.character(NA)))
+
+Seg_Calls <- Seg_dfInventory %>%
+  select(any_of(c("Sample Sequencing Name",
+                  "Chr.",
+                  "Gene",
+                  "total_cn",
+                  "minor_cn",
+                  "segments.loh.pier",
+                  "purity",
+                  "ploidy" ,
+                  "Seg_CNV",
+                  "Seg_TCN",
+                  "Seg_PACN",
+                  #copy number relative to ploidy
+                  "Seg_CRP",
+                  "Zygosity",
+                  "Allelic Status",
+                  "hGVS Protein",
+                  "hGVS cDNA",
+                  "Rep. Class.",
+                  "VAF",
+                  colnames(resSGZ)))) #%>%
+  #remove distinct, only display if protein change is not NA or if CNV is amp, gain, homdel
+ # filter(!is.na(`hGVS cDNA`) | Seg_CNV %in% c("amp", "homdel"))
+
+```
+
+```{r, splitSamples,results='hide'}
+
+# if current trial is nonclinical, split by Project
+if(params$currTrial == "non-clinical"){
+  
+  ID <- unique(sort(dfIntegInventory$`Project`))
+  
+  #relabel NA as string NA's
+  dfIntegInventory$`Project` <- dfIntegInventory$`Project` %>%
+    replace_na("NA")
+  
+   split <- split(dfIntegInventory, list(dfIntegInventory$`Project`,
+                                        dfIntegInventory$`Sample Sequencing Name`),
+                 drop = TRUE)
+  
+}else{
+  ### if else rp3500-01, rp6306-01, rp6306-02
+  
+  # subset and group sample by patient id, sample type, and seq name into nested list
+  ID <- unique(sort(dfIntegInventory$SUBJID))
+
+  # split by patient level and sample types/ patient
+  # not all patients will have both PBMC and Tumor samples
+  split <- split(dfIntegInventory, list(dfIntegInventory$SUBJID,
+                                        dfIntegInventory$SAMPTYPE2,
+                                        dfIntegInventory$`Sample Sequencing Name`),
+                 drop = TRUE)
+
+}
+
+# shorten subsetted df names to match headers during knit
+shortenSplitName <- paste(sub("\\_GER.*|\\_GEC.*", "", names(split)), # extract everything before GER* or GEC* 
+                          sub('.*\\_', '', names(split)), # extract everything after the last "_"
+                          sep = "_" )
+
+names(split) <- shortenSplitName
+
+# store df subsets by patient ID
+IDSplit <- lapply(ID, function(x){
+  split[grepl(x, names(split))]
+})
+
+names(IDSplit) <- ID
+
+```
+
+```{r,include = FALSE}
+  DT::datatable(matrix())
+```
+
+```{r, revised, results='asis' ,fig.width=20,fig.height=18,out.width="50%"}
+### Gene lvl summary table
+summarySelectedTables <- list(Facets = FacetsSelected, 
+                      Stats = StatsSelected,
+                      #CNV = CNVLong, 
+                      Variants = VariantSelected,
+                      Calls = Calls)
+
+
+### segment lvl summary table
+segmentSelectedTables <- list(Segments = Segments, 
+                              `Segment Variants`= Seg_VariantSelected,
+                              `Segment Calls` = Seg_Calls,
+                              Complete = Seg_dfInventory)
+
+for(patient in names(IDSplit)){
+  # print patient headers
+  cat(sprintf("\n\n# %s\n\n", patient))
+  cat("\n\n")
+  for(sampleType in names(IDSplit[[patient]])){
+    
+     # extract sample ID for each patient/sample type
+      currSampleID <- 
+        unique(IDSplit[[patient]][[sampleType]]$`Sample Sequencing Name`)
+      
+      # shorten the sequencing name, append to header/dfs 
+    shortenSampleID <- paste(sub("\\_GER.*|\\_GEC.*", "", currSampleID), # extract everything before GER* or GEC* 
+                          sub('.*\\_', '', currSampleID), # extract everything after the last "_"
+                          sep = "_" )
+    
+    IDSplit[[patient]][[sampleType]]$`Short Sample Sequencing Name` <- 
+      shortenSampleID
+    
+      
+    cat(sprintf("\n\n## %s\n\n", paste(sampleType)))
+      cat("\n\n")
+      
+      cat(paste("GCP path to bam file:", unique(IDSplit[[patient]][[sampleType]]$GCP_path_to_bam)))
+      
+       cat("\n\n")
+      
+      # print Summary Table headers per patient/sample pair
+      cat(sprintf("\n\n### %s\n\n", "Gene Level Summary Tables {.tabset .tabset-pills}"))
+      cat("\n\n")
+ 
+      # summaryTableList <- lapply(summarySelectedTables, function(currDF){
+      #   IDSplit[[patient]][[sampleType]] %>%
+      #     select(`Short Sample Sequencing Name`, #replace with shorten sample IDs
+      #            any_of(colnames(currDF))) %>% 
+      #     distinct() %>%
+      #     select(-any_of("Sample Sequencing Name")) # remove long sample IDs, keep original in "Complete" DF
+      # })
+      
+      summaryTableList <- lapply(summarySelectedTables, function(currDF){
+        currDF[currDF$`Sample Sequencing Name` %in% currSampleID,]
+        currDF %>%
+          filter(`Sample Sequencing Name` == currSampleID) %>%
+          mutate(`Short Sample Sequencing Name` = shortenSampleID, .before = 1) %>%
+          distinct() %>%
+          select(-`Sample Sequencing Name`) # remove long sample IDs, keep original in "Complete" DF
+      })
+      
+      summaryTableList[["Complete"]] <- IDSplit[[patient]][[sampleType]]
+
+      #create sub table headers
+      for(table in names(summaryTableList)){
+        cat(sprintf("\n\n#### %s\n\n", table))
+        cat("\n\n")
+
+         cat(knitr::knit_print(DT::datatable(summaryTableList[[table]],
+                                     width = "100%",
+                                     height = "auto",
+                                 rownames = FALSE,
+                                 options = list( scrollX = TRUE))))
+
+         cat("\n\n")
+         cat("\n\n")
+         cat("\n\n")
+         cat("\n\n")
+      }
+
+      # print plot headers per patient/sample pair
+      cat(sprintf("\n\n### %s\n\n", "Plots {.tabset .tabset-pills}"))
+      cat("\n\n")
+      
+      # list all plot paths per sample ID
+      imagePaths <- list.files(path = paste0(currSampleID, "/"),
+                 pattern = ".png",
+                 recursive = T,
+                 include.dirs = T,
+                 full.names = T)
+      
+      # select for non QC image Paths
+      #imagePaths <- imagePaths[grepl("rawsummary|facets", imagePaths)]
+      imagePaths <- imagePaths[grepl("\\.rawsummary|\\.facets", imagePaths)]
+
+      #omit spider.facets
+      imagePaths <- imagePaths[!grepl("spider.facets", imagePaths)]
+         
+      
+      for(path in imagePaths){
+        #print(path)
+        ### label each plot's name extracted 
+        plotName <- strsplit(x = path,split = "/")[[1]]
+        plotName <- plotName[length(plotName)]
+        plotName <- plotName %>%
+          gsub(".png", "", .) %>%
+          gsub(currSampleID, "", .) %>%
+          gsub("^\\.", "\\1", .)
+        #print(plotName)
+        
+        cat(sprintf("\n\n#### %s\n\n", plotName))
+        cat("\n\n")
+        
+        cat(paste0("![](", path, ")"))
+        
+  
+      }
+      
+      #### ==== segment lvl knits ==== ####
+      cat(sprintf("\n\n### %s\n\n", "Segment Level Summary Tables {.tabset .tabset-pills}"))
+      cat("\n\n")
+      
+      #create sub table headers
+      for(table in names(segmentSelectedTables)){
+        cat(sprintf("\n\n#### %s\n\n", table))
+        cat("\n\n")
+        
+        segmentSelectedTables[[table]] <- segmentSelectedTables[[table]] %>%
+          filter(`Sample Sequencing Name` == currSampleID) %>%
+          mutate(`Short Sample Sequencing Name` = shortenSampleID, .before = 1) %>%
+          distinct() %>%
+          relocate(`Sample Sequencing Name`,.after = last_col()) # remove long sample IDs, keep original in "Complete" DF
+
+         cat(knitr::knit_print(DT::datatable(segmentSelectedTables[[table]],
+                                     width = "100%",
+                                     height = "auto",
+                                 rownames = FALSE,
+                                 options = list( scrollX = TRUE))))
+
+         cat("\n\n")
+         cat("\n\n")
+         cat("\n\n")
+         cat("\n\n")
+      }
+      
+      # print plot headers per chromosome plot if seg contains variant, amplification or HomDel
+      cat(sprintf("\n\n### %s\n\n", "Chromosome Plots {.tabset .tabset-pills}"))
+      cat("\n\n")
+      
+      chrom_df  <- Seg_dfInventory %>% 
+        filter(!is.na(AAChange) | Seg_CNV %in% c("amp", "homdel")) %>% 
+      distinct(`Chr.`)
+
+      # add chr 19 to all chrom plots
+      # if there are no chrom pos, only append chr19
+      if(nrow(chrom_df) > 0){
+        chr <- c(paste0("chr", chrom_df$Chr.), "chr19")
+      }else{
+        chr <-paste0("chr", "19")
+      }
+    
+      #order 
+      chr <- sort(as.integer(str_remove(chr, "chr")))
+      chr <- paste0("chr", chr)
+
+
+      
+       # list all plot paths per sample ID
+      chrPaths <- list.files(path = paste0(currSampleID,"/"),
+                 pattern = paste0(chr, "\\.", collapse = "|"),
+                 recursive = T,
+                 include.dirs = T,
+                 full.names = T)
+      
+      # order
+      chrPaths <- chrPaths[order(nchar(chrPaths))]
+      
+      for(currChr in seq_along(chrPaths)){
+        ### label each plot's name extracted
+        
+        cat(sprintf("\n\n#### %s\n\n", chr[currChr]))
+        cat("\n\n")
+        
+        cat(paste0("![](", chrPaths[currChr], ")"))
+        
+  
+      }
+  }
+}
+```
+
+
+
+```{r, save,eval=TRUE}
+###TODO:
+inventoryList <- list("gene_level_inventory" = dfIntegInventory,
+                        "segment_level_inventory" = Seg_dfInventory)
+
+# may need to change
+write.xlsx(inventoryList,
+           here::here(paste0(params$currSample,".",
+                             params$currTrial, "_", 
+                             "SNiPDx_by_samples",
+                             "_Inventory.xlsx")))
+# write.xlsx(Seg_dfInventory,
+#            here::here(paste0(params$currSample,".",
+#                              params$currTrial, "_", 
+#                              "SNiPDx_by_samples",
+#                              "_Segment_Inventory.xlsx")))
+
+```
